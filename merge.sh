@@ -1,7 +1,10 @@
 #!/bin/bash
 
+# 保存脚本所在的原始目录
+original_dir=$(pwd)
+
 # 检查配置文件是否存在
-config_file="./merge/commits.conf"
+config_file="./commits.conf"
 if [ ! -f "$config_file" ]; then
     echo "Error: Configuration file '$config_file' not found"
     echo "Please create $config_file with the following format:"
@@ -10,7 +13,63 @@ if [ ! -f "$config_file" ]; then
     echo "official_new  tag:v1.11.0"
     echo "debank_old    branch:main"
     echo "debank_new    branch:develop"
+    echo "working_directory /path/to/git/repository"
     exit 1
+fi
+
+# 初始化变量
+working_directory=""
+official_old_ref=""
+official_new_ref=""
+debank_old_ref=""
+debank_new_ref=""
+
+# 读取配置文件中的所有设置
+while read -r line; do
+    # 跳过注释行和空行
+    [[ "$line" =~ ^#.*$ || -z "$line" ]] && continue
+    
+    # 读取每行的第一个和余下部分
+    read -r tag value <<< "$line"
+    
+    if [[ -n "$tag" && -n "$value" ]]; then  # 确保必需字段不为空
+        # 根据tag设置对应的变量
+        case "$tag" in
+            "official_old")
+                official_old_ref="$value"
+                ;;
+            "official_new")
+                official_new_ref="$value"
+                ;;
+            "debank_old")
+                debank_old_ref="$value"
+                ;;
+            "debank_new")
+                debank_new_ref="$value"
+                ;;
+            "working_directory")
+                working_directory="$value"
+                echo "Working directory set to: $working_directory"
+                ;;
+        esac
+    fi
+done < "$config_file"
+
+# 保存配置文件的绝对路径，以便在切换目录后仍能访问
+config_file_abs=$(realpath "$config_file")
+
+# 如果指定了工作目录，切换到该目录
+if [ -n "$working_directory" ]; then
+    if [ -d "$working_directory" ]; then
+        echo "Changing to directory: $working_directory"
+        cd "$working_directory" || {
+            echo "Error: Failed to change to directory '$working_directory'"
+            exit 1
+        }
+    else
+        echo "Error: Working directory '$working_directory' does not exist"
+        exit 1
+    fi
 fi
 
 # 获取所有远程仓库的分支和标签
@@ -23,29 +82,23 @@ get_commit_hash() {
     local ref=$1
     local hash
     
-    echo "Debug: Processing ref: $ref" >&2
-    
     # 检查引用类型
     if [[ "$ref" =~ ^tag: ]]; then
         # 处理tag
         local tag=${ref#tag:}
-        echo "Debug: Found tag: $tag" >&2
         
         # 先直接尝试解析tag
         hash=$(git rev-parse "$tag" 2>/dev/null)
         if [ $? -eq 0 ]; then
-            echo "Debug: Resolved tag directly: $hash" >&2
             echo "$hash"
             return
         fi
         
         # 尝试解析不同格式的tag引用
         for prefix in "" "refs/tags/" "refs/remotes/official/tags/" "refs/remotes/origin/tags/"; do
-            echo "Debug: Trying tag with prefix: $prefix$tag" >&2
             if git show-ref --verify --quiet "${prefix}${tag}"; then
                 hash=$(git rev-parse "${prefix}${tag}" 2>/dev/null)
                 if [ $? -eq 0 ]; then
-                    echo "Debug: Resolved tag with prefix: $hash" >&2
                     echo "$hash"
                     return
                 fi
@@ -56,12 +109,10 @@ get_commit_hash() {
         if [[ "$tag" == */* ]]; then
             local remote=$(echo "$tag" | cut -d'/' -f1)
             local tag_name=$(echo "$tag" | cut -d'/' -f2-)
-            echo "Debug: Trying tag with remote prefix: $remote and tag name: $tag_name" >&2
             
             if git show-ref --verify --quiet "refs/tags/$tag_name"; then
                 hash=$(git rev-parse "refs/tags/$tag_name" 2>/dev/null)
                 if [ $? -eq 0 ]; then
-                    echo "Debug: Resolved split tag: $hash" >&2
                     echo "$hash"
                     return
                 fi
@@ -73,17 +124,13 @@ get_commit_hash() {
     elif [[ "$ref" =~ ^branch: ]]; then
         # 处理branch
         local branch=${ref#branch:}
-        echo "Debug: Found branch: $branch" >&2
 
         # 尝试多种方式解析分支
         if git show-ref --verify --quiet "refs/remotes/$branch"; then
-            echo "Debug: Found as remote branch: refs/remotes/$branch" >&2
             hash=$(git rev-parse "refs/remotes/$branch" 2>/dev/null)
         elif git show-ref --verify --quiet "refs/heads/$branch"; then
-            echo "Debug: Found as local branch: refs/heads/$branch" >&2
             hash=$(git rev-parse "refs/heads/$branch" 2>/dev/null)
         elif git show-ref --verify --quiet "$branch"; then
-            echo "Debug: Found branch directly: $branch" >&2
             hash=$(git rev-parse "$branch" 2>/dev/null)
         else
             echo "Error: Branch '$branch' not found in any format" >&2
@@ -97,7 +144,6 @@ get_commit_hash() {
         fi
     else
         # 处理commit hash
-        echo "Debug: Found commit hash: $ref" >&2
         hash=$(git rev-parse "$ref" 2>/dev/null)
         if [ $? -ne 0 ]; then
             echo "Error: Invalid commit hash '$ref'" >&2
@@ -110,65 +156,14 @@ get_commit_hash() {
         exit 1
     fi
     
-    echo "Debug: Resolved hash: $hash" >&2
     echo "$hash"
 }
 
-# 初始化变量
-official_old_ref=""
-official_new_ref=""
-debank_old_ref=""
-debank_new_ref=""
-official_old_hash=""
-official_new_hash=""
-debank_old_hash=""
-debank_new_hash=""
-
-# 读取配置文件
-while read -r line; do
-    # 跳过注释行和空行
-    [[ "$line" =~ ^#.*$ || -z "$line" ]] && continue
-    
-    # 读取两列数据
-    read -r tag ref <<< "$line"
-    
-    echo "Debug: Read line - tag: '$tag', ref: '$ref'" >&2
-    
-    if [[ -n "$tag" && -n "$ref" ]]; then  # 确保必需字段不为空
-        # 根据tag设置对应的变量
-        case "$tag" in
-            "official_old")
-                official_old_ref="$ref"
-                official_old_hash=$(get_commit_hash "$ref")
-                ;;
-            "official_new")
-                official_new_ref="$ref"
-                official_new_hash=$(get_commit_hash "$ref")
-                ;;
-            "debank_old")
-                debank_old_ref="$ref"
-                debank_old_hash=$(get_commit_hash "$ref")
-                ;;
-            "debank_new")
-                debank_new_ref="$ref"
-                debank_new_hash=$(get_commit_hash "$ref")
-                ;;
-        esac
-    fi
-done < "$config_file"
-
-# 验证所需的commit是否都存在
-echo "Debug: Checking hashes:" >&2
-echo "official_old_hash: $official_old_hash" >&2
-echo "official_new_hash: $official_new_hash" >&2
-echo "debank_old_hash: $debank_old_hash" >&2
-echo "debank_new_hash: $debank_new_hash" >&2
-
-if [ -z "$official_old_hash" ] || [ -z "$official_new_hash" ] || \
-   [ -z "$debank_old_hash" ] || [ -z "$debank_new_hash" ]; then
-    echo "Error: Missing required commit hashes in $config_file"
-    exit 1
-fi
+# 解析引用为commit哈希
+official_old_hash=$(get_commit_hash "$official_old_ref")
+official_new_hash=$(get_commit_hash "$official_new_ref")
+debank_old_hash=$(get_commit_hash "$debank_old_ref")
+debank_new_hash=$(get_commit_hash "$debank_new_ref")
 
 # 显示将要比较的commit
 echo "Using the following commits:"
@@ -182,8 +177,14 @@ echo "Debank new:   $debank_new_hash"
 echo "             (from: $debank_new_ref)"
 echo ""
 
-# 创建临时目录存放diff文件
-temp_dir="./merge_$(date '+%Y%m%d_%H%M%S')"
+if [ -z "$official_old_hash" ] || [ -z "$official_new_hash" ] || \
+   [ -z "$debank_old_hash" ] || [ -z "$debank_new_hash" ]; then
+    echo "Error: Missing required commit hashes in $config_file"
+    exit 1
+fi
+
+# 创建临时目录存放diff文件（在原始目录中创建）
+temp_dir="$original_dir/merge_$(date '+%Y%m%d_%H%M%S')"
 mkdir -p "$temp_dir"
 echo "Using temporary directory: $temp_dir"
 
@@ -223,15 +224,31 @@ echo "=== Changes Comparison Report ===" > "$temp_dir/comparison_report.txt"
 echo "Timestamp: $(date)" >> "$temp_dir/comparison_report.txt"
 echo "" >> "$temp_dir/comparison_report.txt"
 
-# 获取所有涉及的文件
-all_files=$(ls "$temp_dir/debank_changes" "$temp_dir/official_changes" | sort -u)
+# 添加commits.conf内容到报告开头
+echo "=== Configuration Used (commits.conf) ===" >> "$temp_dir/comparison_report.txt"
+cat "$config_file_abs" >> "$temp_dir/comparison_report.txt"
+echo "" >> "$temp_dir/comparison_report.txt"
+echo "=== Comparison Results ===" >> "$temp_dir/comparison_report.txt"
+echo "" >> "$temp_dir/comparison_report.txt"
+
+# 获取所有涉及的文件（改用find命令，避免ls命令输出目录标题）
+all_files=()
+for file in "$temp_dir/debank_changes"/*.diff "$temp_dir/official_changes"/*.diff; do
+    if [ -f "$file" ]; then
+        # 只获取文件名部分
+        filename=$(basename "$file")
+        all_files+=("$filename")
+    fi
+done
+
+# echo "all_files: ${all_files[@]}"
 
 # 用于跟踪存在差异的文件
 different_files=()
 official_only_files=()
 debank_only_files=()
 
-for diff_file in $all_files; do
+for diff_file in "${all_files[@]}"; do
     debank_diff="$temp_dir/debank_changes/$diff_file"
     official_diff="$temp_dir/official_changes/$diff_file"
     
